@@ -17,14 +17,23 @@ if (window.console) {
 	}
 
 	test_terms = [
-		'asdf',
-		'asdf,qwer,zxcv parti:(m,s) år:(1995-2000)',
-		'mer .* till författare:(anders borg)',
-		'mer pengar till .*'
+		'pengar, krig parti:(m)',
+		'pengar parti:(m), krig parti:(m)',
+		'"pengar, krig" parti:(m)',
+		'pengar parti:(s), pengar parti:(m)',
+		'pengar parti:(s, v, mp), pengar parti:(m,fp,l,c)',
+		'mer pengar till, krig år:(97-99)',
+		'mer pengar till, krig år:(1997-1999)',
+		'mer pengar till det här landet år:(1997-1999)',
+		'mer pengar till .* år:(19970801-19990801)',
+		'mer pengar till .* för att kunna',
+		'mer pengar till landet för .* kunna',
+		'mer .* till landet för att kunna',
+		'mer .* till'
 	]
 
 	test_terms.forEach(function(entry) {
-		http_req.open('GET', 'http://0.0.0.0:9000/motioner?search_phrase=' + entry, false);
+		http_req.open('GET', 'http://0.0.0.0:9000/motioner?searchPhrase=' + entry, false);
 		http_req.send();
 	});
 

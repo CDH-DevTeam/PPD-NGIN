@@ -9,5 +9,5 @@ GET		/							controllers.Application.index
 GET		/assets/*file				controllers.Assets.versioned(path="/public", file: Asset)
 
 # API
-GET		/doc_count/:doc_type		controllers.Application.get_doc_count(doc_type: String)
-GET		/motioner					controllers.Application.get_motioner_timeline(search_phrase: String)
+GET		/docCount/:docType			controllers.Application.getDocCount(docType: String)
+GET		/motioner					controllers.Application.getMotionerTimeline(searchPhrase: String)
