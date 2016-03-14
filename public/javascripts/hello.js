@@ -8,14 +8,14 @@ if (window.console) {
 	http_req.onreadystatechange = function() {
 		if (http_req.readyState === XMLHttpRequest.DONE) {
 			if (http_req.status === 200) {
-				//console.log(JSON.parse(http_req.responseText));
-				console.log(http_req.responseText);
+				console.log(JSON.parse(http_req.responseText));
+				//console.log(http_req.responseText);
 			} else {
 				console.log(http_req.responseText);
 			}
 		}
 	}
-
+	/*
 	test_terms = [
 		'pengar, krig parti:(m)',
 		'pengar parti:(m), krig parti:(m)',
@@ -30,6 +30,10 @@ if (window.console) {
 		'mer pengar till landet för .* kunna',
 		'mer .* till landet för att kunna',
 		'mer .* till'
+	]
+	*/
+	test_terms = [
+		'skola, vård, mer pengar, mer utbildning'
 	]
 
 	test_terms.forEach(function(entry) {

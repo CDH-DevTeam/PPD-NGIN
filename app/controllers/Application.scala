@@ -37,6 +37,8 @@ class Application extends Controller {
 	val QUERY_TYPE_TERM: String = "term"
 	val QUERY_TYPE_PHRASE: String = "phrase"
 	val QUERY_TYPE_WILDCARD: String = "wildcard"
+
+	val MOTIONER_FIRST_DATE_MILLISECONDS: Long = 0L
 	
 	/*
 	 *	Actions
@@ -92,25 +94,18 @@ class Application extends Controller {
 			}
 		}
 
-		/*
-		// Create ES queries
-		val data = Json.obj(
-			"query" -> Json.obj(
-				"match" -> Json.obj(
-					"dokument.html" -> match_tags.mkString(" ")
-				)
-			)
-		)
-
-		println(data)
-
+		
+		// Create ES query
+		var queryData = createTimelineQuery(queryBuilderList)
+		
 		// Query ES
-		WS.url(ES_HOST + ES_INDEX + "/" + es_type + "/_search")
+		WS.url(ES_HOST + ES_INDEX + "/" + ES_TYPE + "/_search")
 			.withAuth(ES_USER, ES_PW, WSAuthScheme.BASIC)
-			.post(data)
+			.post(queryData)
 			.map { response =>
 				if (response.status == 200) {
-					Ok(response.json)
+					Ok(createTimelineResponse(response.json))
+					//Ok(response.json)
 				} else {
 					InternalServerError(response.body)
 				}
@@ -118,19 +113,155 @@ class Application extends Controller {
 			.recover {
 				case e: Throwable => BadRequest("Bad request!")
 			}
-		*/
-
-		Future {
-			Thread.sleep(1000)
-			"tjenare mannen"
-		}.map {
-			res => Ok(res)
-		}
 	}
 	
 	/*
 	 *	Help Functions
 	 */
+
+	def createTimelineResponse(responseData: JsValue): JsValue = {
+
+		// Check if shard failed
+		val failedCount: Int = (responseData \ "_shards" \ "failed").as[Int]
+		if (failedCount > 0) {
+			return Json.obj("message" -> "Elasticsearch query failed.")
+		}
+
+		// Include aggregations
+		var termAgg: List[JsObject] = List()
+		for (pa <- (responseData \ "aggregations" \ "term_agg" \ "buckets").as[List[JsObject]]) {
+			println(pa \ "key")
+			termAgg ::= Json.obj(
+				"key" -> (pa \ "key").as[JsString],
+				"type" -> "term",
+				"doc_count" -> (pa \ "doc_count").as[JsNumber],
+				"buckets" -> (pa \ "date_agg" \ "buckets").as[JsArray]
+			)
+		}
+
+		var phraseAgg: List[JsObject] = List()
+		for (pa <- (responseData \ "aggregations" \ "phrase_agg" \ "buckets").as[List[JsObject]]) {
+			println(pa \ "key")
+			phraseAgg ::= Json.obj(
+				"key" -> (pa \ "key").as[JsString],
+				"type" -> "phrase",
+				"doc_count" -> (pa \ "doc_count").as[JsNumber],
+				"buckets" -> (pa \ "date_agg" \ "buckets").as[JsArray]
+			)
+		}
+		
+		var wildcardAgg: List[JsObject] = List()
+		for (pa <- (responseData \ "aggregations" \ "wildcard_agg" \ "buckets").as[List[JsObject]]) {
+			println(pa \ "key")
+			phraseAgg ::= Json.obj(
+				"key" -> (pa \ "key").as[JsString],
+				"type" -> "wildcard",
+				"doc_count" -> (pa \ "doc_count").as[JsNumber],
+				"buckets" -> (pa \ "date_agg" \ "buckets").as[JsArray]
+			)
+		}
+		
+		return Json.toJson(termAgg ::: phraseAgg ::: wildcardAgg)
+	}
+
+	// Create ES queries
+	def createTimelineQuery(queryBuilderList: List[QueryBuilder]): JsObject = {
+		
+		var queryFilter: List[JsObject] = List()
+		var termAgg: List[String] = List()
+		var phraseAgg: List[String] = List()
+		var wildcardAgg: String = ""
+
+		// Find query types and searches, if wildcard, ignore the rest.
+		var wildcardIncluded = false
+		for (qbl <- queryBuilderList) {
+			if (!wildcardIncluded) {
+				if (qbl.searchQuery.queryType == QUERY_TYPE_TERM) {
+					queryFilter ::= Json.obj("match" -> Json.obj("dokument.html" -> qbl.searchQuery.query))
+				}
+				else if (qbl.searchQuery.queryType == QUERY_TYPE_PHRASE) {
+					queryFilter ::= Json.obj("match_phrase" -> Json.obj("dokument.html.shingles" -> qbl.searchQuery.query))
+				}
+				else if (qbl.searchQuery.queryType == QUERY_TYPE_WILDCARD) {
+					queryFilter = Json.obj("match_phrase" -> Json.obj("dokument.html.shingles" -> qbl.searchQuery.query)) :: Nil
+					wildcardIncluded = true
+				}
+			}
+		}
+
+		// Create query aggregations.
+		if (!wildcardIncluded) {
+			for (qbl <- queryBuilderList) {
+				if (qbl.searchQuery.queryType == QUERY_TYPE_TERM) {
+					termAgg ::= qbl.searchQuery.query
+				}
+				else if (qbl.searchQuery.queryType == QUERY_TYPE_PHRASE) {
+					phraseAgg ::= qbl.searchQuery.query
+				}
+			}
+		} else {
+			for (qbl <- queryBuilderList) {
+				if (qbl.searchQuery.queryType == QUERY_TYPE_WILDCARD) {
+					wildcardAgg = qbl.searchQuery.query
+				}
+			}
+		}
+		
+		// Create query data object.
+		var currentDate = new DateTime()
+		var yearAggregation: JsObject = Json.obj(
+			"date_agg" -> Json.obj(
+				"date_histogram" -> Json.obj(
+					"field" -> "dokument.datum",
+					"interval" -> "year",
+					"format" -> "yyyy",
+					"min_doc_count" -> 0,
+					"extended_bounds" -> Json.obj(
+						"min" -> MOTIONER_FIRST_DATE_MILLISECONDS,
+						"max" -> currentDate.getMillis()
+					)
+				)
+			)
+		)
+		var queryData = Json.obj(
+			"size" -> 0,
+			"query" -> Json.obj(
+				"filtered" -> Json.obj(
+					"filter" -> Json.obj(
+						"bool" -> Json.obj(
+							"should" -> Json.toJson(queryFilter)
+						)
+					)
+				)
+			),
+			"aggs" -> Json.obj(
+				"term_agg" -> Json.obj(
+					"terms" -> Json.obj(
+						"field" -> "dokument.html",
+						"include" -> Json.toJson(termAgg)
+					),
+					"aggs" -> yearAggregation
+				),
+				"phrase_agg" -> Json.obj(
+					"terms" -> Json.obj(
+						"field" -> "dokument.html.shingles",
+						"include" -> Json.toJson(phraseAgg)
+					),
+					"aggs" -> yearAggregation
+				),
+				"wildcard_agg" -> Json.obj(
+					"terms" -> Json.obj(
+						"field" -> "dokument.html.shingles",
+						"include" -> wildcardAgg,
+						"size" -> 20
+					),
+					"aggs" -> yearAggregation
+				)
+			)
+		)
+
+		return queryData
+	}
 
 	// Parser for search queries
 	def queryParser(searchPhrase: String) : List[QueryBuilder] = {
@@ -253,51 +384,6 @@ class Application extends Controller {
 		return queryBuilderList
 
 	}
-	/*
-	def query_parser(search_phrase: String) : QueryBuilder = {
-
-		// Extract filter from search phrase
-		var pattern = "(\\S*?):\\(.*?\\)".r
-		val filter_extractions = pattern.findAllIn(search_phrase)
-		val search_filter = pattern.replaceAllIn(search_phrase, "")
-
-
-		//var date_filters: List[(String, Int, Int)] = List()
-		var date_filters: List[DateFilter] = List()
-		var word_filters: List[WordFilter] = List()
-
-		// Parse filter terms
-		for(filter <- filter_extractions) {
-
-			var key: Option[String] = "(.*?)(?=:)".r.findFirstIn(filter.trim)
-			var filter_params: Option[String] = "(?<=\\()(.*?)(?=\\))".r.findFirstIn(filter.trim)
-
-			// If filter key and params are found
-			if (key != None && filter_params != None) {
-
-				// Check if filter params contain year segment or string filters
-				if (filter_params.get.contains("-")) {
-					var start_year: Option[String] = "(\\d*?)(?=\\-)".r.findFirstIn(filter_params.get)
-					var end_year: Option[String] = "(?<=\\-)(\\d*?)($|\\,|\\s)".r.findFirstIn(filter_params.get)
-					
-					if (start_year != None && end_year != None) {
-
-						date_filters = DateFilter(key.get, start_year.get.toInt, end_year.get.toInt) :: date_filters
-					}
-
-				} else {
-					word_filters = WordFilter(key.get, filter_params.get.split(",").map(_.trim)) :: word_filters
-				}
-			}
-		}
-
-		return QueryBuilder(
-			search_filter,
-			date_filters,
-			word_filters
-		)
-	}
-	*/
 
 }
 
