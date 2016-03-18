@@ -39,6 +39,17 @@ class Application extends Controller {
 	val QUERY_TYPE_WILDCARD: String = "wildcard"
 
 	val MOTIONER_FIRST_DATE_MILLISECONDS: Long = 0L
+	val MOTIONER_HIT_RETURN_COUNT: Int = 4
+	val MOTIONER_SHINGLE_COUNT: Int = 20
+	val MOTIONER_SCROLL_ALIVE_TIME: String = "1m"
+
+	// Mappings decoder, if first value in tuple is defined, the field is of nested type.
+	val MOTIONER_MAPPINGS_DECODER: Map[String, Tuple2[String, String]] = Map(
+		"parti" -> ("dokintressent", "dokintressent.intressent.partibet"),
+		"författare" -> ("dokintressent", "dokintressent.intressent.namn"),
+		"titel" -> (null, "dokument.titel"),
+		"år" -> (null, "dokument.datum")
+	)
 	
 	/*
 	 *	Actions
@@ -50,13 +61,43 @@ class Application extends Controller {
 	}
 
 	// Get information from ES index about types and counts.
-	def getDocCount(docType: String) = Action.async {
+	def getMotionerTimelineTotal() = Action.async {
 
-		WS.url(ES_HOST + ES_INDEX + "/" + docType + "/_count")
-			.get()
+		val ES_TYPE = Play.current.configuration.getString("es.type.motioner").get
+
+		// Create query data object.
+		var currentDate = new DateTime()
+		var queryData = Json.obj(
+			"size" -> 0,
+			"aggs" -> Json.obj(
+				"date_agg" -> Json.obj(
+					"date_histogram" -> Json.obj(
+						"field" -> "dokument.datum",
+						"interval" -> "year",
+						"format" -> "yyyy",
+						"min_doc_count" -> 0,
+						"extended_bounds" -> Json.obj(
+							"min" -> MOTIONER_FIRST_DATE_MILLISECONDS,
+							"max" -> currentDate.getMillis()
+						)
+					)
+				)
+			)
+		)
+			
+
+		WS.url(ES_HOST + ES_INDEX + "/" + ES_TYPE + "/_search")
+			.withAuth(ES_USER, ES_PW, WSAuthScheme.BASIC)
+			.post(queryData)
 			.map { response =>
 				if (response.status == 200) {
-					Ok((response.json \ "count").as[JsNumber])
+					Ok(
+						Json.obj(
+							"buckets" -> (response.json \ "aggregations" \ "date_agg" \ "buckets").as[JsArray],
+							"doc_count" -> (response.json \ "hits" \ "total").as[JsNumber],
+							"key" -> "total"
+						)
+					)
 				} else {
 					InternalServerError(response.body)
 				}
@@ -66,9 +107,8 @@ class Application extends Controller {
 			}
 	}
 
-
-	
-	def getMotionerTimeline(searchPhrase: String) = Action.async {
+	// Get data and hits for timeline search
+	def getMotionerTimelineSearch(searchPhrase: String) = Action.async {
 
 		// Set variables
 		val ES_TYPE = Play.current.configuration.getString("es.type.motioner").get
@@ -115,6 +155,37 @@ class Application extends Controller {
 			}
 	}
 	
+
+
+	// Get information from ES index about types and counts.
+	def getMotionerHitScroll(scrollId: String) = Action.async {
+
+		val ES_TYPE = Play.current.configuration.getString("es.type.motioner").get
+
+		var queryData = Json.obj(
+			"scroll" -> MOTIONER_SCROLL_ALIVE_TIME,
+			"scroll_id" -> scrollId
+		)
+
+		WS.url(ES_HOST + "_search/scroll")
+			.withAuth(ES_USER, ES_PW, WSAuthScheme.BASIC)
+			.post(queryData)
+			.map { response =>
+				if (response.status == 200) {
+					Ok(response.json)
+				} else {
+					InternalServerError(response.body)
+				}
+			}
+			.recover {
+				case e: Throwable => BadRequest("Bad request!")
+			}
+	}
+
+
+
+
+
 	/*
 	 *	Help Functions
 	 */
@@ -129,8 +200,7 @@ class Application extends Controller {
 
 		// Include aggregations
 		var termAgg: List[JsObject] = List()
-		for (pa <- (responseData \ "aggregations" \ "term_agg" \ "buckets").as[List[JsObject]]) {
-			println(pa \ "key")
+		for (pa <- (responseData \ "aggregations" \ "term_agg" \ "buckets").as[List[JsObject]].reverse) {
 			termAgg ::= Json.obj(
 				"key" -> (pa \ "key").as[JsString],
 				"type" -> "term",
@@ -140,8 +210,7 @@ class Application extends Controller {
 		}
 
 		var phraseAgg: List[JsObject] = List()
-		for (pa <- (responseData \ "aggregations" \ "phrase_agg" \ "buckets").as[List[JsObject]]) {
-			println(pa \ "key")
+		for (pa <- (responseData \ "aggregations" \ "phrase_agg" \ "buckets").as[List[JsObject]].reverse) {
 			phraseAgg ::= Json.obj(
 				"key" -> (pa \ "key").as[JsString],
 				"type" -> "phrase",
@@ -151,8 +220,7 @@ class Application extends Controller {
 		}
 		
 		var wildcardAgg: List[JsObject] = List()
-		for (pa <- (responseData \ "aggregations" \ "wildcard_agg" \ "buckets").as[List[JsObject]]) {
-			println(pa \ "key")
+		for (pa <- (responseData \ "aggregations" \ "wildcard_agg" \ "buckets").as[List[JsObject]].reverse) {
 			phraseAgg ::= Json.obj(
 				"key" -> (pa \ "key").as[JsString],
 				"type" -> "wildcard",
@@ -162,15 +230,17 @@ class Application extends Controller {
 		}
 		
 		return Json.toJson(termAgg ::: phraseAgg ::: wildcardAgg)
+
 	}
 
 	// Create ES queries
 	def createTimelineQuery(queryBuilderList: List[QueryBuilder]): JsObject = {
-		
+
 		var queryFilter: List[JsObject] = List()
 		var termAgg: List[String] = List()
 		var phraseAgg: List[String] = List()
 		var wildcardAgg: String = ""
+		//var mustFilters: List[JsObject] = List()
 
 		// Find query types and searches, if wildcard, ignore the rest.
 		var wildcardIncluded = false
@@ -206,6 +276,47 @@ class Application extends Controller {
 				}
 			}
 		}
+
+		// Create query filters
+		/*
+		for (qbl <- queryBuilderList) {
+			for (tf <- qbl.termFilters) {
+				if (MOTIONER_MAPPINGS_DECODER(tf.key)._1 != null) {
+					mustFilters ::= Json.obj(
+						"nested" -> Json.obj(
+							"path" -> MOTIONER_MAPPINGS_DECODER(tf.key)._1,
+							"query" -> Json.obj(
+								"bool" -> Json.obj(
+									"must" -> Json.toJson(tf.terms.map(term => Json.obj("match" -> Json.obj(MOTIONER_MAPPINGS_DECODER(tf.key)._2 -> term))))
+								)
+							)
+						)
+					)
+				} else {
+					for (term <- tf.terms) {
+						mustFilters ::= Json.obj(
+							"match" -> Json.obj(
+								MOTIONER_MAPPINGS_DECODER(tf.key)._2 -> term
+							)
+						)
+					}
+				}
+			}
+
+			for (tf <- qbl.dateFilters) {
+				mustFilters ::= Json.obj(
+					"range" -> Json.obj(
+						MOTIONER_MAPPINGS_DECODER(tf.key)._2 -> Json.obj(
+							"gte" -> tf.startDate,
+							"lte" -> tf.endDate,
+							"format" -> "epoch_millis"
+						)
+					)
+				)
+
+			}
+		}
+		*/
 		
 		// Create query data object.
 		var currentDate = new DateTime()
@@ -223,6 +334,8 @@ class Application extends Controller {
 				)
 			)
 		)
+
+		// "must" -> Json.toJson(mustFilters)
 		var queryData = Json.obj(
 			"size" -> 0,
 			"query" -> Json.obj(
@@ -253,12 +366,14 @@ class Application extends Controller {
 					"terms" -> Json.obj(
 						"field" -> "dokument.html.shingles",
 						"include" -> wildcardAgg,
-						"size" -> 20
+						"size" -> JsNumber(MOTIONER_SHINGLE_COUNT)
 					),
 					"aggs" -> yearAggregation
 				)
 			)
 		)
+
+		//println(Json.prettyPrint(queryData))
 
 		return queryData
 	}
@@ -386,65 +501,3 @@ class Application extends Controller {
 	}
 
 }
-
-
-
-
-
-/*
-
-def test = Action.async {
-
-	Future {
-		Thread.sleep(2000)
-		"tjenare mannen"
-	}.map {
-		res => Ok(res)
-	}
-
-	/*
-	val ok = Ok("Hello world!")
-	val notFound = NotFound
-	val pageNotFound = NotFound(<h1>Page not found</h1>)
-	val badRequest = BadRequest(views.html.form(formWithErrors))
-	val oops = InternalServerError("Oops")
-	val anyStatus = Status(488)("Strange response type")
-	*/
-
-}
-
-
-def get_motioner_all() = Action {
-	print("get motioner all")
-	Ok("Get all motioner")
-}
-
-def testRequest = Action.async {
-
-	val data = Json.obj(
-		"size" -> "0",
-		"query" -> Json.obj(
-			"match_phrase" -> Json.obj(
-				"anforandetext.anforandetext_shingles" -> "mer pengar till"
-			)
-		),
-		"aggs" -> Json.obj(
-			"ngram_agg" -> Json.obj(
-				"terms" -> Json.obj(
-					"field" -> "anforandetext.anforandetext_shingles",
-					"include" -> "mer pengar till .*",
-					"size" -> 10
-				)
-			)
-		)
-	)
-
-	WS.url(ES_HOST + "ppd/type_anforande/_seach?pretty=true")
-		.post(data)
-		.map { response =>
-			Ok(response.body)
-		}
-
-}
-
-*/

@@ -8,13 +8,18 @@ if (window.console) {
 	http_req.onreadystatechange = function() {
 		if (http_req.readyState === XMLHttpRequest.DONE) {
 			if (http_req.status === 200) {
-				console.log(JSON.parse(http_req.responseText));
-				//console.log(http_req.responseText);
+				var json_data = JSON.parse(http_req.responseText)
+				console.log(json_data);
+				
 			} else {
 				console.log(http_req.responseText);
 			}
 		}
 	}
+
+	http_req.open('GET', 'http://0.0.0.0:9000/motioner/timeline/total', false);
+	http_req.send();
+
 	/*
 	test_terms = [
 		'pengar, krig parti:(m)',
@@ -32,13 +37,14 @@ if (window.console) {
 		'mer .* till'
 	]
 	*/
+	
 	test_terms = [
-		'skola, vård, mer pengar, mer utbildning'
+		'skola parti:(m), pengar'
 	]
 
 	test_terms.forEach(function(entry) {
-		http_req.open('GET', 'http://0.0.0.0:9000/motioner?searchPhrase=' + entry, false);
+		http_req.open('GET', 'http://0.0.0.0:9000/motioner/timeline/search?searchPhrase=' + entry, false);
 		http_req.send();
 	});
-
+	
 }
