@@ -9,6 +9,7 @@ import play.api.libs.concurrent.Execution.Implicits._
 
 import scala.concurrent.{Await, Future}
 import scala.util.matching.Regex
+import scala.util.Random
 
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -18,8 +19,8 @@ import org.joda.time.format._
 
 case class DateFilter(key: String, startDate: Long, endDate: Long) {}
 case class TermFilter(key: String, terms: List[String]) {}
-case class SearchQuery(queryType: String, query: String) {}
-case class QueryBuilder(searchQuery: SearchQuery, dateFilters: List[DateFilter], termFilters: List[TermFilter]) {}
+case class SearchQuery(queryType: String, query: String, idSeq: String) {}
+case class QueryBuilder(searchQuery: SearchQuery, termFilters: List[TermFilter]) {}
 
 class Application extends Controller {
 
@@ -27,21 +28,27 @@ class Application extends Controller {
 	 *	Variables
 	 */
 
+	val random = new Random()
+
 	val ES_HOST = Play.current.configuration.getString("es.host").get
 	val ES_INDEX = Play.current.configuration.getString("es.index").get
 	val ES_USER = Play.current.configuration.getString("es.username").get
 	val ES_PW = Play.current.configuration.getString("es.password").get
 
+	val ES_EXEC_HINT_PARAM = "global_ordinals_hash"
 	val MAX_SHINGLE_SIZE: Int = 4
 
 	val QUERY_TYPE_TERM: String = "term"
 	val QUERY_TYPE_PHRASE: String = "phrase"
 	val QUERY_TYPE_WILDCARD: String = "wildcard"
 
+	val QUERY_WILDCARD_SUB: String = "*"
+	val QUERY_WILDCARD_ES: String = ".*"
+
 	val MOTIONER_FIRST_DATE_MILLISECONDS: Long = 0L
-	val MOTIONER_HIT_RETURN_COUNT: Int = 4
-	val MOTIONER_SHINGLE_COUNT: Int = 20
-	val MOTIONER_SCROLL_ALIVE_TIME: String = "1m"
+	val MOTIONER_HIT_RETURN_COUNT: Int = Play.current.configuration.getString("api.hit_return_count").get.toInt
+	val MOTIONER_AGG_MAX_COUNT: Int = Play.current.configuration.getString("api.agg_max_count").get.toInt
+	val MOTIONER_SCROLL_ALIVE_TIME: String = Play.current.configuration.getString("api.scroll_alive_time").get
 
 	// Mappings decoder, if first value in tuple is defined, the field is of nested type.
 	val MOTIONER_MAPPINGS_DECODER: Map[String, Tuple2[String, String]] = Map(
@@ -115,13 +122,14 @@ class Application extends Controller {
 
 		// Parse search string
 
-		println(" ")
-		println("Search phrase: " + searchPhrase)
+		//println(" ")
+		//println("Search phrase: " + searchPhrase)
 
 		val queryBuilderList = queryParser(searchPhrase)
 		
+		/*
 		for (qbl <- queryBuilderList) {
-			println(qbl.searchQuery.queryType + " : " + qbl.searchQuery.query)
+			println(qbl.searchQuery.queryType + " : " + qbl.searchQuery.query + " (" + qbl.searchQuery.idSeq + ")")
 			for (tf <- qbl.termFilters) {
 				print("   " + tf.key + " : ")
 				for (t <- tf.terms) {
@@ -129,12 +137,9 @@ class Application extends Controller {
 				}
 				println("")
 			}
-			for (tf <- qbl.dateFilters) {
-				println("   " + tf.key + " : " + tf.startDate + " - " + tf.endDate)
-			}
 		}
+		*/
 
-		
 		// Create ES query
 		var queryData = createTimelineQuery(queryBuilderList)
 		
@@ -144,7 +149,7 @@ class Application extends Controller {
 			.post(queryData)
 			.map { response =>
 				if (response.status == 200) {
-					Ok(createTimelineResponse(response.json))
+					Ok(createTimelineResponse(response.json, queryBuilderList))
 					//Ok(response.json)
 				} else {
 					InternalServerError(response.body)
@@ -154,6 +159,7 @@ class Application extends Controller {
 				case e: Throwable => BadRequest("Bad request!")
 			}
 	}
+	
 	
 
 
@@ -190,7 +196,8 @@ class Application extends Controller {
 	 *	Help Functions
 	 */
 
-	def createTimelineResponse(responseData: JsValue): JsValue = {
+	// Create response
+	def createTimelineResponse(responseData: JsValue, queryBuilderList: List[QueryBuilder]): JsValue = {
 
 		// Check if shard failed
 		val failedCount: Int = (responseData \ "_shards" \ "failed").as[Int]
@@ -199,38 +206,39 @@ class Application extends Controller {
 		}
 
 		// Include aggregations
-		var termAgg: List[JsObject] = List()
-		for (pa <- (responseData \ "aggregations" \ "term_agg" \ "buckets").as[List[JsObject]].reverse) {
-			termAgg ::= Json.obj(
-				"key" -> (pa \ "key").as[JsString],
-				"type" -> "term",
-				"doc_count" -> (pa \ "doc_count").as[JsNumber],
-				"buckets" -> (pa \ "date_agg" \ "buckets").as[JsArray]
-			)
+		var aggList: List[JsObject] = List()
+		var aggObject: List[JsObject] = List()
+		for (qbl <- queryBuilderList) {
+
+			// Check if aggregation contains filters
+			if (qbl.termFilters.isEmpty) {
+				aggObject = (responseData \ "aggregations" \ qbl.searchQuery.idSeq \ "buckets").as[List[JsObject]]
+			} else {
+				aggObject = (responseData \ "aggregations" \ qbl.searchQuery.idSeq \ "term_agg" \ "buckets").as[List[JsObject]]
+			}
+			
+			// Create list of aggregations.
+			for (bucketObject <- aggObject) {
+				aggList ::= Json.obj(
+					"key" -> (bucketObject \ "key").as[JsString],
+					"search_query" -> qbl.searchQuery.query,
+					"type" -> qbl.searchQuery.queryType,
+					"filters" -> qbl.termFilters.map(tf => Json.obj(tf.key -> tf.terms)),
+					"doc_count" -> (bucketObject \ "doc_count").as[JsNumber],
+					"buckets" -> (bucketObject \ "date_agg" \ "buckets").as[JsArray]
+				)
+			}
 		}
 
-		var phraseAgg: List[JsObject] = List()
-		for (pa <- (responseData \ "aggregations" \ "phrase_agg" \ "buckets").as[List[JsObject]].reverse) {
-			phraseAgg ::= Json.obj(
-				"key" -> (pa \ "key").as[JsString],
-				"type" -> "phrase",
-				"doc_count" -> (pa \ "doc_count").as[JsNumber],
-				"buckets" -> (pa \ "date_agg" \ "buckets").as[JsArray]
-			)
+		aggList = aggList.sortWith {
+			(a,b) =>
+				(a \ "doc_count").as[Int] > (b \ "doc_count").as[Int]
 		}
-		
-		var wildcardAgg: List[JsObject] = List()
-		for (pa <- (responseData \ "aggregations" \ "wildcard_agg" \ "buckets").as[List[JsObject]].reverse) {
-			phraseAgg ::= Json.obj(
-				"key" -> (pa \ "key").as[JsString],
-				"type" -> "wildcard",
-				"doc_count" -> (pa \ "doc_count").as[JsNumber],
-				"buckets" -> (pa \ "date_agg" \ "buckets").as[JsArray]
-			)
-		}
-		
-		return Json.toJson(termAgg ::: phraseAgg ::: wildcardAgg)
 
+		return Json.obj(
+			"es_query_time" -> (responseData \ "took").as[JsNumber],
+			"data" -> Json.toJson(aggList)
+		)
 	}
 
 	// Create ES queries
@@ -240,7 +248,23 @@ class Application extends Controller {
 		var termAgg: List[String] = List()
 		var phraseAgg: List[String] = List()
 		var wildcardAgg: String = ""
-		//var mustFilters: List[JsObject] = List()
+
+		// Create query data object.
+		var currentDate = new DateTime()
+		var yearAggregation: JsObject = Json.obj(
+			"date_agg" -> Json.obj(
+				"date_histogram" -> Json.obj(
+					"field" -> "dokument.datum",
+					"interval" -> "year",
+					"format" -> "yyyy",
+					"min_doc_count" -> 0,
+					"extended_bounds" -> Json.obj(
+						"min" -> MOTIONER_FIRST_DATE_MILLISECONDS,
+						"max" -> currentDate.getMillis()
+					)
+				)
+			)
+		)
 
 		// Find query types and searches, if wildcard, ignore the rest.
 		var wildcardIncluded = false
@@ -277,65 +301,79 @@ class Application extends Controller {
 			}
 		}
 
-		// Create query filters
-		/*
+		// Create aggregation queries.
+		var aggregations: Map[String, JsObject] = Map()
 		for (qbl <- queryBuilderList) {
-			for (tf <- qbl.termFilters) {
-				if (MOTIONER_MAPPINGS_DECODER(tf.key)._1 != null) {
-					mustFilters ::= Json.obj(
-						"nested" -> Json.obj(
-							"path" -> MOTIONER_MAPPINGS_DECODER(tf.key)._1,
-							"query" -> Json.obj(
-								"bool" -> Json.obj(
-									"must" -> Json.toJson(tf.terms.map(term => Json.obj("match" -> Json.obj(MOTIONER_MAPPINGS_DECODER(tf.key)._2 -> term))))
+
+			// Check if shingle field is required.
+			var queryField: String = "dokument.html.shingles"
+			if (qbl.searchQuery.queryType == QUERY_TYPE_TERM) {
+				queryField = "dokument.html"
+			}
+
+			// Check if there is any filter for this search.
+			if (qbl.termFilters.isEmpty) {
+				aggregations += qbl.searchQuery.idSeq -> Json.obj(
+					"terms" -> Json.obj(
+						"min_doc_count" -> 0,
+						"field" -> queryField,
+						"execution_hint" -> ES_EXEC_HINT_PARAM,
+						"include" -> qbl.searchQuery.query,
+						"size" -> MOTIONER_AGG_MAX_COUNT
+					),
+					"aggs" -> yearAggregation
+				)
+			} else {
+				var filters: List[JsObject] = List()
+				for (tf <- qbl.termFilters) {
+					if (MOTIONER_MAPPINGS_DECODER.exists(_._1 == tf.key)) {
+
+						// Create filter object.
+						var tmpFilter: JsObject = Json.obj(
+							"bool" -> Json.obj(
+								"should" -> Json.toJson(tf.terms.map(term => Json.obj("match" -> Json.obj(MOTIONER_MAPPINGS_DECODER(tf.key)._2 -> term))))
+							)
+						)
+
+						// Check if filter field is nested.
+						if (MOTIONER_MAPPINGS_DECODER(tf.key)._1 != null) {
+							filters ::= Json.obj(
+								"nested" -> Json.obj(
+									"path" -> MOTIONER_MAPPINGS_DECODER(tf.key)._1,
+									"query" -> tmpFilter
 								)
 							)
-						)
-					)
-				} else {
-					for (term <- tf.terms) {
-						mustFilters ::= Json.obj(
-							"match" -> Json.obj(
-								MOTIONER_MAPPINGS_DECODER(tf.key)._2 -> term
+						} else {
+							filters ::= Json.obj(
+								"query" -> tmpFilter
 							)
-						)
+						}
 					}
 				}
-			}
 
-			for (tf <- qbl.dateFilters) {
-				mustFilters ::= Json.obj(
-					"range" -> Json.obj(
-						MOTIONER_MAPPINGS_DECODER(tf.key)._2 -> Json.obj(
-							"gte" -> tf.startDate,
-							"lte" -> tf.endDate,
-							"format" -> "epoch_millis"
+				// Define aggregation object.
+				aggregations += qbl.searchQuery.idSeq -> Json.obj(
+					"filter" -> Json.obj(
+						"bool" -> Json.obj(
+							"must" -> Json.toJson(filters)
+						)
+					),
+					"aggs" -> Json.obj(
+						"term_agg" -> Json.obj(
+							"terms" -> Json.obj(
+								"min_doc_count" -> 0,
+								"field" -> queryField,
+								"execution_hint" -> ES_EXEC_HINT_PARAM,
+								"include" -> qbl.searchQuery.query,
+								"size" -> MOTIONER_AGG_MAX_COUNT
+							),
+							"aggs" -> yearAggregation
 						)
 					)
 				)
-
 			}
 		}
-		*/
-		
-		// Create query data object.
-		var currentDate = new DateTime()
-		var yearAggregation: JsObject = Json.obj(
-			"date_agg" -> Json.obj(
-				"date_histogram" -> Json.obj(
-					"field" -> "dokument.datum",
-					"interval" -> "year",
-					"format" -> "yyyy",
-					"min_doc_count" -> 0,
-					"extended_bounds" -> Json.obj(
-						"min" -> MOTIONER_FIRST_DATE_MILLISECONDS,
-						"max" -> currentDate.getMillis()
-					)
-				)
-			)
-		)
 
-		// "must" -> Json.toJson(mustFilters)
 		var queryData = Json.obj(
 			"size" -> 0,
 			"query" -> Json.obj(
@@ -347,30 +385,7 @@ class Application extends Controller {
 					)
 				)
 			),
-			"aggs" -> Json.obj(
-				"term_agg" -> Json.obj(
-					"terms" -> Json.obj(
-						"field" -> "dokument.html",
-						"include" -> Json.toJson(termAgg)
-					),
-					"aggs" -> yearAggregation
-				),
-				"phrase_agg" -> Json.obj(
-					"terms" -> Json.obj(
-						"field" -> "dokument.html.shingles",
-						"include" -> Json.toJson(phraseAgg)
-					),
-					"aggs" -> yearAggregation
-				),
-				"wildcard_agg" -> Json.obj(
-					"terms" -> Json.obj(
-						"field" -> "dokument.html.shingles",
-						"include" -> wildcardAgg,
-						"size" -> JsNumber(MOTIONER_SHINGLE_COUNT)
-					),
-					"aggs" -> yearAggregation
-				)
-			)
+			"aggs" -> Json.toJson(aggregations)
 		)
 
 		//println(Json.prettyPrint(queryData))
@@ -388,18 +403,15 @@ class Application extends Controller {
 		var splitResult: List[String] = List()
 		var startIndex: Int = 0
 		var currIndex: Int = 0
-		var inQuotes: Boolean = false
 		var inParentheses: Boolean = false
 		for (c <- searchPhrase) {
-
-			if (c == '"') inQuotes = !inQuotes
 
 			if (c == '(') inParentheses = true
 			else if (c == ')') inParentheses = false
 
 			if (currIndex == (searchPhrase.length() - 1)) {
 				splitResult ::= searchPhrase.substring(startIndex).trim()
-			} else if (c == ',' && !inQuotes && !inParentheses) {
+			} else if (c == ',' && !inParentheses) {
 				splitResult ::= searchPhrase.substring(startIndex, currIndex).trim()
 				startIndex = currIndex + 1
 			}
@@ -412,9 +424,7 @@ class Application extends Controller {
 		for (sr <- splitResult) {
 
 			var searchQueries: List[SearchQuery] = List()
-			var dateFilters: List[DateFilter] = List()
 			var termFilters: List[TermFilter] = List()
-
 
 			// Parse splitted term
 			var pattern = "(\\S*?):\\(.*?\\)".r
@@ -423,16 +433,16 @@ class Application extends Controller {
 
 			// Parse search query
 			var wordCount: Int = searchQuery.split(" ").length
-			if (searchQuery.contains('"')) { // Multiple terms
-				for (sq <- searchQuery.replace('"', ' ').split(",").toList) {
-					searchQueries ::= SearchQuery(QUERY_TYPE_TERM, sq.trim())
+			if (searchQuery.contains('(') && searchQuery.contains(')')) { // Multiple terms
+				for (sq <- searchQuery.replace('(', ' ').replace(')', ' ').split(",").toList) {
+					searchQueries ::= SearchQuery(QUERY_TYPE_TERM, sq.trim(), randomAlphanumericString(10))
 				}
 			} else {
-				if (searchQuery.contains('*')) { // Wildcard
+				if (searchQuery.contains(QUERY_WILDCARD_SUB)) { // Wildcard
 
 					if (wordCount > MAX_SHINGLE_SIZE) {
 
-						var wildCardIndex: Int = searchQuery.split(" ").indexWhere(_.contains("*"))
+						var wildCardIndex: Int = searchQuery.split(" ").indexWhere(_.contains(QUERY_WILDCARD_SUB))
 						var startSlice: Int =  (wildCardIndex - (MAX_SHINGLE_SIZE - 1))
 						var stopSlice: Int = wildCardIndex + 1
 
@@ -441,16 +451,16 @@ class Application extends Controller {
 							stopSlice = MAX_SHINGLE_SIZE
 						}
 
-						searchQueries ::= SearchQuery(QUERY_TYPE_WILDCARD, searchQuery.split(" ").slice(startSlice, stopSlice).mkString(" ").trim())
+						searchQueries ::= SearchQuery(QUERY_TYPE_WILDCARD, searchQuery.split(" ").slice(startSlice, stopSlice).mkString(" ").replace(QUERY_WILDCARD_SUB, QUERY_WILDCARD_ES).trim(), randomAlphanumericString(10))
 
-					} else searchQueries ::= SearchQuery(QUERY_TYPE_WILDCARD, searchQuery.trim())
+					} else searchQueries ::= SearchQuery(QUERY_TYPE_WILDCARD, searchQuery.replace(QUERY_WILDCARD_SUB, QUERY_WILDCARD_ES).trim(), randomAlphanumericString(10))
 
 				} else if (wordCount > 1) { // Phrase
-					if (wordCount > MAX_SHINGLE_SIZE) searchQueries ::= SearchQuery(QUERY_TYPE_PHRASE, searchQuery.split(" ").take(MAX_SHINGLE_SIZE).mkString(" ").trim())
-					else searchQueries ::= SearchQuery(QUERY_TYPE_PHRASE, searchQuery.trim())
+					if (wordCount > MAX_SHINGLE_SIZE) searchQueries ::= SearchQuery(QUERY_TYPE_PHRASE, searchQuery.split(" ").take(MAX_SHINGLE_SIZE).mkString(" ").trim(), randomAlphanumericString(10))
+					else searchQueries ::= SearchQuery(QUERY_TYPE_PHRASE, searchQuery.trim(), randomAlphanumericString(10))
 
 				} else { // Term
-					searchQueries ::= SearchQuery(QUERY_TYPE_TERM, searchQuery.trim())
+					searchQueries ::= SearchQuery(QUERY_TYPE_TERM, searchQuery.trim(), randomAlphanumericString(10))
 				}
 			}
 
@@ -463,6 +473,7 @@ class Application extends Controller {
 				// Check if filter key and params are found
 				if (filterKey != None && filterParams != None) {
 
+					/* DATE FILTERS FOR THE FUTURE
 					// Check if filter params contain year segement or term filters
 					if (filterParams.get.contains("-")) {
 						var startDate: String = "(\\d*?)(?=\\-)".r.findFirstIn(filterParams.get).get
@@ -483,7 +494,9 @@ class Application extends Controller {
 
 					} else {
 						termFilters ::= TermFilter(filterKey.get, filterParams.get.split(",").map(_.trim).toList)
-					}
+					}*/
+
+					termFilters ::= TermFilter(filterKey.get, filterParams.get.split(",").map(_.trim).toList)
 
 				}
 
@@ -491,7 +504,7 @@ class Application extends Controller {
 
 			// Insert parsed data into query builder object
 			for (sq <- searchQueries) {
-				queryBuilderList ::= QueryBuilder(sq, dateFilters, termFilters)
+				queryBuilderList ::= QueryBuilder(sq, termFilters)
 			}
 
 		}
@@ -499,5 +512,13 @@ class Application extends Controller {
 		return queryBuilderList
 
 	}
+
+	// Generate a random string of length n from the given alphabet
+	def randomString(alphabet: String)(n: Int): String = 
+		Stream.continually(random.nextInt(alphabet.size)).map(alphabet).take(n).mkString
+
+	// Generate a random alphabnumeric string of length n
+	def randomAlphanumericString(n: Int) = 
+		randomString("abcdefghijklmnopqrstuvwxyz0123456789")(n)
 
 }

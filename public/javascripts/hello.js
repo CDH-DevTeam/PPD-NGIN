@@ -24,23 +24,24 @@ if (window.console) {
 	test_terms = [
 		'pengar, krig parti:(m)',
 		'pengar parti:(m), krig parti:(m)',
-		'"pengar, krig" parti:(m)',
+		'(pengar, krig) parti:(m)',
+		'(pengar, krig) parti:(m), (invandring, lönsamhet) parti:(s)',
 		'pengar parti:(s), pengar parti:(m)',
 		'pengar parti:(s, v, mp), pengar parti:(m,fp,l,c)',
-		'mer pengar till, krig år:(97-99)',
-		'mer pengar till, krig år:(1997-1999)',
-		'mer pengar till det här landet år:(1997-1999)',
-		'mer pengar till .* år:(19970801-19990801)',
-		'mer pengar till .* för att kunna',
-		'mer pengar till landet för .* kunna',
-		'mer .* till landet för att kunna',
-		'mer .* till'
+		'mer pengar till * för att kunna',
+		'mer pengar till landet för * kunna',
+		'mer * till landet för att kunna',
+		'mer * till',
+		'pengar parti:(s,v), mer pengar, mer pengar till *'
 	]
 	*/
 	
 	test_terms = [
-		'skola parti:(m), pengar'
+		'pengar parti:(s,v) titel:(ekonomi), entreprenörskap'
 	]
+	
+	
+	
 
 	test_terms.forEach(function(entry) {
 		http_req.open('GET', 'http://0.0.0.0:9000/motioner/timeline/search?searchPhrase=' + entry, false);
