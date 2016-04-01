@@ -12,4 +12,7 @@ GET		/assets/*file					controllers.Assets.versioned(path="/public", file: Asset)
 GET		/motioner/timeline/search		controllers.Application.getMotionerTimelineSearch(searchPhrase: String)
 GET		/motioner/timeline/total		controllers.Application.getMotionerTimelineTotal()
 
-#GET	/motioner/scroll				controllers.Application.getMotionerHitScroll(scrollId: String)
+GET		/motioner/hits					controllers.Application.getMotionerHits(searchPhrase: String, startDate: String, endDate: String, fromIndex: Int ?= 0)
+
+GET		/queries/latest					controllers.Application.getQueriesTop()
+GET		/queries/top					controllers.Application.getQueriesLatest()
