@@ -41,7 +41,7 @@ if (window.console) {
 	*/
 	
 	test_terms = [
-		'pengar, krig parti:(m)',
+		'ekonomisk *',
 	]
 	
 	
@@ -50,11 +50,11 @@ if (window.console) {
 	
 
 	test_terms.forEach(function(entry) {
-		//http_req.open('GET', 'http://0.0.0.0:9000/motioner/timeline/search?searchPhrase=' + entry, false);
-		//http_req.open('GET', 'http://0.0.0.0:9000/motioner/hits?searchPhrase=' + entry + '&startDate=2006&endDate=2008&fromIndex=3000', false);
-		http_req.open('GET', 'http://0.0.0.0:9000/queries/latest', false);
-		http_req.send();
-		http_req.open('GET', 'http://0.0.0.0:9000/queries/top', false);
+		http_req.open('GET', 'http://0.0.0.0:9000/motioner/timeline/search?searchPhrase=' + entry, false);
+		//http_req.open('GET', 'http://0.0.0.0:9000/motioner/hits?searchPhrase=' + entry + '&startDate=1971&endDate=2015&fromIndex=0', false);
+		//http_req.open('GET', 'http://0.0.0.0:9000/queries/latest', false);
+		//http_req.send();
+		//http_req.open('GET', 'http://0.0.0.0:9000/queries/top', false);
 		http_req.send();
 	});
 	

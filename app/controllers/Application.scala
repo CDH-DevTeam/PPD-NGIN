@@ -51,11 +51,11 @@ class Application extends Controller {
 	val MOTIONER_AGG_MAX_COUNT: Int = Play.current.configuration.getString("api.agg_max_count").get.toInt
 
 	// Mappings decoder, if first value in tuple is defined, the field is of nested type.
-	val MOTIONER_MAPPINGS_DECODER: Map[String, Tuple2[String, String]] = Map(
-		"parti" -> ("dokintressent", "dokintressent.intressent.partibet"),
-		"författare" -> ("dokintressent", "dokintressent.intressent.namn"),
-		"titel" -> (null, "dokument.titel"),
-		"datum" -> (null, "dokument.datum")
+	val MOTIONER_MAPPINGS_DECODER: Map[String, Tuple3[String, String, String]] = Map(
+		"parti" -> ("dokintressent", "dokintressent.intressent.partibet", "match"),
+		"intressent" -> ("dokintressent", "dokintressent.intressent.namn", "match_phrase"),
+		"titel" -> (null, "dokument.titel", "match_phrase"),
+		"datum" -> (null, "dokument.datum", "range")
 	)
 
 	// Check host url
@@ -199,7 +199,6 @@ class Application extends Controller {
 
 		val ES_INDEX_QUERY = Play.current.configuration.getString("es.queries.index").get
 		val ES_TYPE_SEARCH_QUERY = Play.current.configuration.getString("es.queries.type.search_query").get
-		val ES_TYPE_SEARCH_FILTER = Play.current.configuration.getString("es.queries.type.search_filter").get
 
 		// Create query data object.
 		var currentDate = new DateTime()
@@ -240,7 +239,6 @@ class Application extends Controller {
 
 		val ES_INDEX_QUERY = Play.current.configuration.getString("es.queries.index").get
 		val ES_TYPE_SEARCH_QUERY = Play.current.configuration.getString("es.queries.type.search_query").get
-		val ES_TYPE_SEARCH_FILTER = Play.current.configuration.getString("es.queries.type.search_filter").get
 
 		// Create query data object.
 		var currentDate = new DateTime()
@@ -417,7 +415,7 @@ class Application extends Controller {
 						// Create filter object.
 						var tmpFilter: JsObject = Json.obj(
 							"bool" -> Json.obj(
-								"should" -> Json.toJson(tf.terms.map(term => Json.obj("match" -> Json.obj(MOTIONER_MAPPINGS_DECODER(tf.key)._2 -> term))))
+								"should" -> Json.toJson(tf.terms.map(term => Json.obj(MOTIONER_MAPPINGS_DECODER(tf.key)._3 -> Json.obj(MOTIONER_MAPPINGS_DECODER(tf.key)._2 -> term))))
 							)
 						)
 
@@ -532,7 +530,7 @@ class Application extends Controller {
 					// Create filter object.
 					var tmpFilter: JsObject = Json.obj(
 						"bool" -> Json.obj(
-							"should" -> Json.toJson(tf.terms.map(term => Json.obj("match" -> Json.obj(MOTIONER_MAPPINGS_DECODER(tf.key)._2 -> term))))
+							"should" -> Json.toJson(tf.terms.map(term => Json.obj(MOTIONER_MAPPINGS_DECODER(tf.key)._3 -> Json.obj(MOTIONER_MAPPINGS_DECODER(tf.key)._2 -> term))))
 						)
 					)
 
@@ -555,7 +553,7 @@ class Application extends Controller {
 
 			// Add date filters.
 			filters += Json.obj(
-				"range" -> Json.obj(
+				MOTIONER_MAPPINGS_DECODER("datum")._3 -> Json.obj(
 					MOTIONER_MAPPINGS_DECODER("datum")._2 -> Json.obj(
 						"gte" -> dateSpan.startDate.getMillis(),
 						"lte" -> dateSpan.endDate.getMillis(),
@@ -581,6 +579,8 @@ class Application extends Controller {
 
 		}
 
+		//println(Json.prettyPrint(Json.toJson(queryList)))
+
 		return queryList
 
 	}
@@ -590,38 +590,27 @@ class Application extends Controller {
 
 		val ES_INDEX_QUERY = Play.current.configuration.getString("es.queries.index").get
 		val ES_TYPE_SEARCH_QUERY = Play.current.configuration.getString("es.queries.type.search_query").get
-		val ES_TYPE_SEARCH_FILTER = Play.current.configuration.getString("es.queries.type.search_filter").get
 
 		var currentDate: DateTime = new DateTime()
 		var dateFormatter: DateTimeFormatter = DateTimeFormat.forPattern("yyyy-MM-dd HH:mm:ss")
 
 		for (qbl <- queryBuilderList) {
 
+			var tmpSearchQuery: String = qbl.searchQuery.query
+			if (tmpSearchQuery.contains(QUERY_WILDCARD_ES)) {
+				tmpSearchQuery = tmpSearchQuery.replace(QUERY_WILDCARD_ES, QUERY_WILDCARD_SUB)
+			}
+
 			// Store search query in ES.
 			var queryData = Json.obj(
-				"term" -> qbl.searchQuery.query,
+				"term" -> tmpSearchQuery,
 				"type" -> qbl.searchQuery.queryType,
 				"date" -> dateFormatter.print(currentDate)
 			)
 			
 			WS.url(ES_HOST + HOST_URL_APPEND + ES_INDEX_QUERY + "/" + ES_TYPE_SEARCH_QUERY)
-			.withAuth(ES_USER, ES_PW, WSAuthScheme.BASIC)
-			.post(queryData)
-
-			// Store search filters in ES.
-			for (tf <- qbl.termFilters) {
-
-				queryData = Json.obj(
-					"field" -> tf.key,
-					"terms" -> Json.toJson(tf.terms.map(term => Json.obj("term" -> term))),
-					"date" -> dateFormatter.print(currentDate)
-				)
-
-				WS.url(ES_HOST + HOST_URL_APPEND + ES_INDEX_QUERY + "/" + ES_TYPE_SEARCH_FILTER)
-					.withAuth(ES_USER, ES_PW, WSAuthScheme.BASIC)
-					.post(queryData)
-
-			}
+				.withAuth(ES_USER, ES_PW, WSAuthScheme.BASIC)
+				.post(queryData)
 
 		}
 
