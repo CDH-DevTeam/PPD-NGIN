@@ -9,10 +9,10 @@ GET		/								controllers.Application.index
 GET		/assets/*file					controllers.Assets.versioned(path="/public", file: Asset)
 
 # API
-GET		/motioner/timeline/search		controllers.Application.getMotionerTimelineSearch(searchPhrase: String)
+GET		/motioner/timeline/search		controllers.Application.getMotionerTimelineSearch(searchPhrase: String, queryMode: String ?= "exact")
 GET		/motioner/timeline/total		controllers.Application.getMotionerTimelineTotal()
 
-GET		/motioner/hits					controllers.Application.getMotionerHits(searchPhrase: String, startDate: String, endDate: String, fromIndex: Int ?= 0)
+GET		/motioner/hits					controllers.Application.getMotionerHits(searchPhrase: String, startDate: String, endDate: String, fromIndex: Int ?= 0, queryMode: String ?= "exact")
 
 GET		/queries/top					controllers.Application.getQueriesTop()
 GET		/queries/latest					controllers.Application.getQueriesLatest()

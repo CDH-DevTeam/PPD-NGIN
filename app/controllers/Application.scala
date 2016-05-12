@@ -46,9 +46,12 @@ class Application extends Controller {
 	val QUERY_WILDCARD_SUB: String = "*"
 	val QUERY_WILDCARD_ES: String = ".*"
 
+	val QUERY_MODES: List[String] = List("exact", "spanNear", "spanNearOrdinal", "anywhere")
+
 	val MOTIONER_FIRST_DATE_MILLISECONDS: Long = 0L
 	val MOTIONER_HIT_RETURN_COUNT: Int = Play.current.configuration.getString("api.hit_return_count").get.toInt
 	val MOTIONER_AGG_MAX_COUNT: Int = Play.current.configuration.getString("api.agg_max_count").get.toInt
+	val SPAN_NEAR_SLOP_COUNT: Int = Play.current.configuration.getString("api.span_near_slop_count").get.toInt
 
 	// Mappings decoder, if first value in tuple is defined, the field is of nested type.
 	val MOTIONER_MAPPINGS_DECODER: Map[String, Tuple3[String, String, String]] = Map(
@@ -119,25 +122,26 @@ class Application extends Controller {
 	}
 
 	// Get data and hits for timeline search.
-	def getMotionerTimelineSearch(searchPhrase: String) = Action.async {
+	def getMotionerTimelineSearch(searchPhrase: String, queryMode: String) = Action.async {
 
 		// Set variables.
 		val ES_TYPE = Play.current.configuration.getString("es.type.motioner").get
+		val parsedQueryMode = checkQueryMode(queryMode)
 
 		// Parse search params.
 		val queryBuilderList = queryParser(searchPhrase)
 
 		// Analyze search queries.
-		var futureList: ListBuffer[Future[String]] = ListBuffer()
+		var futureList: ListBuffer[Future[ListBuffer[String]]] = ListBuffer()
 		for (qbl <- queryBuilderList) {
-			futureList += fetchAnalyzedQuery(qbl)
+			futureList += fetchAnalyzedQuery(qbl, parsedQueryMode)
 		}
 
 		// When analyzed search queries are ready.
 		Future.sequence(futureList).flatMap { analyzedQueries => 
 
 			// Create ES query
-			var queryData = createTimelineQuery(queryBuilderList, analyzedQueries)
+			var queryData = createTimelineQuery(queryBuilderList, analyzedQueries, parsedQueryMode)
 
 			// Store queries
 			storeSearchQueries(queryBuilderList)
@@ -149,7 +153,7 @@ class Application extends Controller {
 			futureResponse.map(
 				response =>
 					if (response.status == 200) {
-						Ok(createTimelineResponse(response.json, queryBuilderList))
+						Ok(createTimelineResponse(response.json, queryBuilderList, parsedQueryMode))
 					} else {
 						InternalServerError(response.body)
 					}
@@ -160,37 +164,47 @@ class Application extends Controller {
 	}
 	
 	
-	def getMotionerHits(searchPhrase: String, startDate: String, endDate: String, fromIndex: Int) = Action.async {
+	def getMotionerHits(searchPhrase: String, startDate: String, endDate: String, fromIndex: Int, queryMode: String) = Action.async {
 		
 		val ES_TYPE = Play.current.configuration.getString("es.type.motioner").get
+		val parsedQueryMode = checkQueryMode(queryMode)
 		
 		// Parse search params.
 		val queryBuilderList = queryParser(searchPhrase)
 		val dateSpan = dateParser(startDate, endDate)
 
-		// Create query.
-		var queryData: Map[String, JsObject] = createHitlistQuery(queryBuilderList, dateSpan, fromIndex)
-		var queryString: String = ""
-
+		// Analyze search queries.
+		var futureList: ListBuffer[Future[ListBuffer[String]]] = ListBuffer()
 		for (qbl <- queryBuilderList) {
-			queryString += "{}\n"
-			queryString += Json.stringify(queryData(qbl.searchQuery.idSeq)) + "\n"
+			futureList += fetchAnalyzedQuery(qbl, parsedQueryMode)
 		}
 
-		// Query ES
-		WS.url(ES_HOST + HOST_URL_APPEND + ES_INDEX + "/" + ES_TYPE + "/_msearch")
-			.withAuth(ES_USER, ES_PW, WSAuthScheme.BASIC)
-			.post(queryString)
-			.map { response =>
-				if (response.status == 200) {
-					Ok(createHitlistResponse(response.json, queryBuilderList, dateSpan, fromIndex))
-				} else {
-					InternalServerError(response.body)
-				}
+		// When analyzed search queries are ready.
+		Future.sequence(futureList).flatMap { analyzedQueries => 
+
+			// Create query.
+			var queryData: Map[String, JsObject] = createHitlistQuery(queryBuilderList, analyzedQueries, dateSpan, fromIndex, parsedQueryMode)
+			var queryString: String = ""
+
+			for (qbl <- queryBuilderList) {
+				queryString += "{}\n"
+				queryString += Json.stringify(queryData(qbl.searchQuery.idSeq)) + "\n"
 			}
-			.recover {
-				case e: Throwable => BadRequest("Bad request!")
-			}
+
+			var futureResponse: Future[WSResponse] = WS.url(ES_HOST + HOST_URL_APPEND + ES_INDEX + "/" + ES_TYPE + "/_msearch")
+				.withAuth(ES_USER, ES_PW, WSAuthScheme.BASIC)
+				.post(queryString)
+
+			futureResponse.map(
+				response =>
+					if (response.status == 200) {
+						Ok(createHitlistResponse(response.json, queryBuilderList, dateSpan, fromIndex))
+					} else {
+						InternalServerError(response.body)
+					}
+			)
+
+		}
 
 	}
 
@@ -275,7 +289,7 @@ class Application extends Controller {
 	 */
 
 	// Create timeline response
-	def createTimelineResponse(responseData: JsValue, queryBuilderList: ListBuffer[QueryBuilder]) : JsValue = {
+	def createTimelineResponse(responseData: JsValue, queryBuilderList: ListBuffer[QueryBuilder], queryMode: String) : JsValue = {
 
 		// Check if shard failed
 		val failedCount: Int = (responseData \ "_shards" \ "failed").as[Int]
@@ -290,18 +304,23 @@ class Application extends Controller {
 		for (qbl <- queryBuilderList) {
 
 			// Check if aggregation contains filters
-			if (qbl.termFilters.isEmpty) {
-				aggObject = (responseData \ "aggregations" \ qbl.searchQuery.idSeq \ "buckets").as[List[JsObject]]
-			} else {
+			if (!qbl.termFilters.isEmpty || (qbl.searchQuery.queryType == QUERY_TYPE_PHRASE && queryMode != QUERY_MODES(0))) {
 				aggObject = (responseData \ "aggregations" \ qbl.searchQuery.idSeq \ "term_agg" \ "buckets").as[List[JsObject]]
-			}
+			} else {
+				aggObject = (responseData \ "aggregations" \ qbl.searchQuery.idSeq \ "buckets").as[List[JsObject]]
+			} 
 			
 			// Create list of aggregations.
 			for (bucketObject <- aggObject) {
+
+				var keyString: String = if (queryMode != QUERY_MODES(0)) qbl.searchQuery.query else (bucketObject \ "key").as[String]
+				var qMode = if (qbl.searchQuery.queryType == QUERY_TYPE_PHRASE) queryMode else null
+
 				aggList += Json.obj(
-					"key" -> (bucketObject \ "key").as[JsString],
+					"key" -> keyString,
 					"search_query" -> qbl.searchQuery.query,
 					"type" -> qbl.searchQuery.queryType,
+					"mode" -> qMode,
 					"filters" -> qbl.termFilters.map(tf => Json.obj(tf.key -> tf.terms)),
 					"doc_count" -> (bucketObject \ "doc_count").as[JsNumber],
 					"buckets" -> (bucketObject \ "date_agg" \ "buckets").as[JsArray]
@@ -322,7 +341,7 @@ class Application extends Controller {
 	}
 
 	// Create timeline query
-	def createTimelineQuery(queryBuilderList: ListBuffer[QueryBuilder], analyzedQueries: ListBuffer[String]) : JsObject = {
+	def createTimelineQuery(queryBuilderList: ListBuffer[QueryBuilder], analyzedQueries: ListBuffer[ListBuffer[String]], queryMode: String) : JsObject = {
 
 		var queryFilter: ListBuffer[JsObject] = ListBuffer()
 		var termAgg: List[String] = List()
@@ -349,6 +368,7 @@ class Application extends Controller {
 
 		// Find query types and searches, if wildcard, ignore the rest.
 		var loopBreak: Boolean = false
+		var analyzedQueryCounter: Int = 0
 		for (qbl <- queryBuilderList) {
 
 			if (qbl.searchQuery.query == "") {
@@ -359,22 +379,60 @@ class Application extends Controller {
 					queryFilter += Json.obj("match" -> Json.obj("dokument.html" -> qbl.searchQuery.query))
 				}
 				else if (qbl.searchQuery.queryType == QUERY_TYPE_PHRASE) {
-					queryFilter += Json.obj("match_phrase" -> Json.obj("dokument.html.shingles" -> qbl.searchQuery.query))
+
+					if (queryMode == QUERY_MODES(0)) { // Exact
+
+						queryFilter += Json.obj("match_phrase" -> Json.obj("dokument.html.shingles" -> qbl.searchQuery.query))
+
+					} else if (queryMode == QUERY_MODES(3)) { // Anywhere
+
+						queryFilter += Json.obj(
+							"match" -> Json.obj(
+								"dokument.html" -> Json.obj(
+									"query" -> qbl.searchQuery.query, 
+									"operator" -> "and"
+								)
+							)
+						)
+
+					} else { // Span near ordinal/not
+
+						var ordinal = if (queryMode == QUERY_MODES(1)) false else true
+						var spanTerms: ListBuffer[JsObject] = ListBuffer()
+						for (st <- analyzedQueries(analyzedQueryCounter)) {
+							spanTerms += Json.obj("span_term" -> Json.obj("dokument.html" -> st))
+						}
+
+						queryFilter += Json.obj(
+							"span_near" -> Json.obj(
+								"clauses" -> Json.toJson(spanTerms),
+								"slop" -> SPAN_NEAR_SLOP_COUNT,
+								"in_order" -> ordinal
+							)
+						)
+
+					}
+
 				}
 				else if (qbl.searchQuery.queryType == QUERY_TYPE_WILDCARD) {
 					queryFilter += Json.obj("match_phrase" -> Json.obj("dokument.html.shingles" -> qbl.searchQuery.query))
 				}
 			}
-		}
 
+			analyzedQueryCounter += 1
+		}
+		
 		// Create aggregation queries.
-		var analyzedQueryCounter: Int = 0
+		analyzedQueryCounter = 0
 		var aggregations: Map[String, JsObject] = Map()
 		for (qbl <- queryBuilderList) {
 
-			// Check if shingle field is required.
+			// Check if shingle field is required and anywhere or span near queries.
 			var queryField: String = "dokument.html.shingles"
-			if (qbl.searchQuery.queryType == QUERY_TYPE_TERM) {
+			var includeRegex: String = analyzedQueries(analyzedQueryCounter)(0)
+			var excludeRegex: String = ""
+
+			if (qbl.searchQuery.queryType == QUERY_TYPE_TERM || (qbl.searchQuery.queryType == QUERY_TYPE_PHRASE && queryMode != QUERY_MODES(0))) {
 				queryField = "dokument.html"
 			}
 
@@ -385,7 +443,8 @@ class Application extends Controller {
 					"field" -> queryField,
 					"execution_hint" -> ES_EXEC_HINT_PARAM,
 					"collect_mode" -> ES_EXEC_SEARCH_PARAM,
-					"include" -> analyzedQueries(analyzedQueryCounter),
+					"include" -> includeRegex,
+					"exclude" -> excludeRegex,
 					"size" -> MOTIONER_AGG_MAX_COUNT
 				),
 				"aggs" -> yearAggregation
@@ -405,10 +464,8 @@ class Application extends Controller {
 			}
 
 			// Check if there is any filter for this search.
-			if (qbl.termFilters.isEmpty) {
-				aggregations += qbl.searchQuery.idSeq -> termAggregation
-			} else {
-				var filters: ListBuffer[JsObject] = ListBuffer()
+			if (!qbl.termFilters.isEmpty || (qbl.searchQuery.queryType == QUERY_TYPE_PHRASE && queryMode != QUERY_MODES(0))) {
+				var shouldFilters: ListBuffer[JsObject] = ListBuffer()
 				for (tf <- qbl.termFilters) {
 					if (MOTIONER_MAPPINGS_DECODER.exists(_._1 == tf.key)) {
 
@@ -421,32 +478,62 @@ class Application extends Controller {
 
 						// Check if filter field is nested.
 						if (MOTIONER_MAPPINGS_DECODER(tf.key)._1 != null) {
-							filters += Json.obj(
+							shouldFilters += Json.obj(
 								"nested" -> Json.obj(
 									"path" -> MOTIONER_MAPPINGS_DECODER(tf.key)._1,
 									"query" -> tmpFilter
 								)
 							)
 						} else {
-							filters += Json.obj(
+							shouldFilters += Json.obj(
 								"query" -> tmpFilter
 							)
 						}
 					}
 				}
 
+				// Must filters for anywhere or near span searches
+				var mustFilters: ListBuffer[JsObject] = ListBuffer()
+				if (queryMode == QUERY_MODES(3)) {
+					mustFilters += Json.obj(
+						"match" -> Json.obj(
+							"dokument.html" -> Json.obj(
+								"query" -> qbl.searchQuery.query, 
+								"operator" -> "and"
+							)
+						)
+					)
+				} else if (queryMode == QUERY_MODES(1) || queryMode == QUERY_MODES(2)) {
+					var ordinal = if (queryMode == QUERY_MODES(1)) false else true
+					var spanTerms: ListBuffer[JsObject] = ListBuffer()
+					for (st <- analyzedQueries(analyzedQueryCounter)) {
+						spanTerms += Json.obj("span_term" -> Json.obj("dokument.html" -> st))
+					}
+
+					mustFilters += Json.obj(
+						"span_near" -> Json.obj(
+							"clauses" -> Json.toJson(spanTerms),
+							"slop" -> SPAN_NEAR_SLOP_COUNT,
+							"in_order" -> ordinal
+						)
+					)
+				}
+
 				// Define aggregation object.
 				aggregations += qbl.searchQuery.idSeq -> Json.obj(
 					"filter" -> Json.obj(
 						"bool" -> Json.obj(
-							"should" -> Json.toJson(filters)
+							"should" -> Json.toJson(shouldFilters),
+							"must" -> Json.toJson(mustFilters)
 						)
 					),
 					"aggs" -> Json.obj(
 						"term_agg" -> termAggregation
 					)
 				)
-			}
+			} else {
+				aggregations += qbl.searchQuery.idSeq -> termAggregation
+			} 
 
 			analyzedQueryCounter += 1
 		}
@@ -507,18 +594,58 @@ class Application extends Controller {
 	}
 
 	// Create hitlist query
-	def createHitlistQuery(queryBuilderList: ListBuffer[QueryBuilder], dateSpan: DateSpan, fromIndex: Int) : Map[String, JsObject] = {
+	def createHitlistQuery(queryBuilderList: ListBuffer[QueryBuilder], analyzedQueries: ListBuffer[ListBuffer[String]], dateSpan: DateSpan, fromIndex: Int, queryMode: String) : Map[String, JsObject] = {
 
 		var queryList: Map[String, JsObject] =  Map()
 
+		var analyzedQueryCounter: Int = 0
 		for (qbl <- queryBuilderList) {
 
 			// Check if term, phrase or wildcard.
-			var matchObject: JsObject = Json.obj("match_phrase" -> Json.obj("dokument.html.shingles" -> qbl.searchQuery.query))
-			if (qbl.searchQuery.query == "") {
+			var matchObject: JsObject = Json.obj("match" -> Json.obj("dokument.html" -> qbl.searchQuery.query)) // Word
+			if (qbl.searchQuery.query == "") { // Match all
+
 				matchObject = Json.obj("match_all" -> Json.obj())
-			} else if (qbl.searchQuery.queryType == QUERY_TYPE_TERM) {
-				matchObject = Json.obj("match" -> Json.obj("dokument.html" -> qbl.searchQuery.query))
+
+			} else if (qbl.searchQuery.queryType == QUERY_TYPE_WILDCARD) { // Wildcard
+
+				matchObject = Json.obj("match_phrase" -> Json.obj("dokument.html.shingles" -> qbl.searchQuery.query))
+
+			} else if (qbl.searchQuery.queryType == QUERY_TYPE_PHRASE) { // Phrase
+
+				if (queryMode == QUERY_MODES(0)) { // Exact
+
+					matchObject = Json.obj("match_phrase" -> Json.obj("dokument.html.shingles" -> qbl.searchQuery.query))
+
+				} else if (queryMode == QUERY_MODES(3)) { // Anywhere
+
+					matchObject = Json.obj(
+						"match" -> Json.obj(
+							"dokument.html" -> Json.obj(
+								"query" -> qbl.searchQuery.query, 
+								"operator" -> "and"
+							)
+						)
+					)
+
+				} else { // Span near ordinal/not
+
+					var ordinal = if (queryMode == QUERY_MODES(1)) false else true
+					var spanTerms: ListBuffer[JsObject] = ListBuffer()
+					for (st <- analyzedQueries(analyzedQueryCounter)) {
+						spanTerms += Json.obj("span_term" -> Json.obj("dokument.html" -> st))
+					}
+
+					matchObject = Json.obj(
+						"span_near" -> Json.obj(
+							"clauses" -> Json.toJson(spanTerms),
+							"slop" -> SPAN_NEAR_SLOP_COUNT,
+							"in_order" -> ordinal
+						)
+					)
+
+				}
+
 			}
 
 			// Add term filters.
@@ -577,9 +704,9 @@ class Application extends Controller {
 				)
 			)
 
-		}
+			analyzedQueryCounter += 1
 
-		//println(Json.prettyPrint(Json.toJson(queryList)))
+		}
 
 		return queryList
 
@@ -617,10 +744,10 @@ class Application extends Controller {
 	}
 	
 	// Fetch analyzed string
-	def fetchAnalyzedQuery(queryBuilder: QueryBuilder) : Future[String] = {
-		
+	def fetchAnalyzedQuery(queryBuilder: QueryBuilder, queryMode: String) : Future[ListBuffer[String]] = {
+
 		var analyzerType = "custom_shingle_analyzer"
-		if (queryBuilder.searchQuery.queryType == QUERY_TYPE_TERM) {
+		if (queryBuilder.searchQuery.queryType == QUERY_TYPE_TERM || (queryBuilder.searchQuery.queryType == QUERY_TYPE_PHRASE && queryMode != QUERY_MODES(0))) {
 			analyzerType = "custom_html_analyzer"
 		}
 
@@ -630,27 +757,37 @@ class Application extends Controller {
 		)
 
 		// Analyze search query
-		val futureResult: Future[String] = WS.url(ES_HOST + HOST_URL_APPEND + ES_INDEX + "/_analyze")
+		val futureResult: Future[ListBuffer[String]] = WS.url(ES_HOST + HOST_URL_APPEND + ES_INDEX + "/_analyze")
 			.withAuth(ES_USER, ES_PW, WSAuthScheme.BASIC)
 			.post(queryData)
 			.map { response =>
 				if (response.status == 200) {
-					var longestToken: String = ""
-					for (token <- (response.json \ "tokens").as[List[JsObject]]) {
-						if ((token \ "token").as[String].length() > longestToken.length()) {
-							longestToken = (token \ "token").as[String]
+
+					if (queryBuilder.searchQuery.queryType == QUERY_TYPE_TERM || (queryBuilder.searchQuery.queryType == QUERY_TYPE_PHRASE && queryMode != QUERY_MODES(0))) {
+						var tokens: ListBuffer[String] = ListBuffer()
+						for (token <- (response.json \ "tokens").as[List[JsObject]]) {
+							tokens += (token \ "token").as[String]
 						}
-					}
 
-					var wildCardIndex: Int = queryBuilder.searchQuery.query.indexOfSlice(QUERY_WILDCARD_ES)
-					if (wildCardIndex > -1) {
-						val (fst, snd) = longestToken.splitAt(wildCardIndex)
-						longestToken = fst.trim() + queryBuilder.searchQuery.query.slice(wildCardIndex - 1, wildCardIndex + QUERY_WILDCARD_ES.length() + 1) + snd.trim()
-					}
+						tokens
+					} else {
+						var longestToken: String = ""
+						for (token <- (response.json \ "tokens").as[List[JsObject]]) {
+							if ((token \ "token").as[String].length() > longestToken.length()) {
+								longestToken = (token \ "token").as[String]
+							}
+						}
 
-					longestToken
+						var wildCardIndex: Int = queryBuilder.searchQuery.query.indexOfSlice(QUERY_WILDCARD_ES)
+						if (wildCardIndex > -1) {
+							val (fst, snd) = longestToken.splitAt(wildCardIndex)
+							longestToken = fst.trim() + queryBuilder.searchQuery.query.slice(wildCardIndex - 1, wildCardIndex + QUERY_WILDCARD_ES.length() + 1) + snd.trim()
+						}
+
+						ListBuffer(longestToken)
+					}
 				} else {
-					queryBuilder.searchQuery.query
+					ListBuffer(queryBuilder.searchQuery.query)
 				}
 				
 			}
@@ -761,6 +898,14 @@ class Application extends Controller {
 
 	}
 
+	def checkQueryMode(queryMode: String) : String = {
+		if (QUERY_MODES.contains(queryMode)) {
+			return queryMode
+		} else {
+			return QUERY_MODES(0)
+		}
+	}
+
 	// Parse start and end date.
 	def dateParser(startDate: String, endDate: String) : DateSpan = {
 
@@ -772,7 +917,7 @@ class Application extends Controller {
 
 		var dateFormatter: DateTimeFormatter = new DateTimeFormatterBuilder().append(null, dateParsers).toFormatter();
 		var startDateObject: DateTime = dateFormatter.parseDateTime(startDate)
-		var endDateObject: DateTime = dateFormatter.parseDateTime(endDate)
+		var endDateObject: DateTime = dateFormatter.parseDateTime(endDate).plusYears(1)
 
 		return DateSpan(startDateObject, endDateObject)
 
