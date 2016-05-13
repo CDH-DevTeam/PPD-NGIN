@@ -12,6 +12,8 @@ GET		/assets/*file					controllers.Assets.versioned(path="/public", file: Asset)
 GET		/motioner/timeline/search		controllers.Application.getMotionerTimelineSearch(searchPhrase: String, queryMode: String ?= "exact")
 GET		/motioner/timeline/total		controllers.Application.getMotionerTimelineTotal()
 
+GET		/motioner/barchart/parties		controllers.Application.getMotionerPartyBarchart(searchPhrase: String, startDate: String, endDate: String, queryMode: String ?= "exact")
+
 GET		/motioner/hits					controllers.Application.getMotionerHits(searchPhrase: String, startDate: String, endDate: String, fromIndex: Int ?= 0, queryMode: String ?= "exact")
 
 GET		/queries/top					controllers.Application.getQueriesTop()

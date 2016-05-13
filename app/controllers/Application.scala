@@ -208,6 +208,45 @@ class Application extends Controller {
 
 	}
 
+	def getMotionerPartyBarchart(searchPhrase: String, startDate: String, endDate: String, queryMode: String) = Action.async {
+
+		// Set variables.
+		val ES_TYPE = Play.current.configuration.getString("es.type.motioner").get
+		val parsedQueryMode = checkQueryMode(queryMode)
+
+		// Parse search params.
+		val queryBuilderList = queryParser(searchPhrase)
+		val dateSpan = dateParser(startDate, endDate)
+
+		// Analyze search queries.
+		var futureList: ListBuffer[Future[ListBuffer[String]]] = ListBuffer()
+		for (qbl <- queryBuilderList) {
+			futureList += fetchAnalyzedQuery(qbl, parsedQueryMode)
+		}
+
+		// When analyzed search queries are ready.
+		Future.sequence(futureList).flatMap { analyzedQueries => 
+
+			// Create ES query
+			var queryData = createBarchartQuery(queryBuilderList, analyzedQueries, dateSpan, parsedQueryMode)
+
+			var futureResponse: Future[WSResponse] = WS.url(ES_HOST + HOST_URL_APPEND + ES_INDEX + "/" + ES_TYPE + "/_search")
+				.withAuth(ES_USER, ES_PW, WSAuthScheme.BASIC)
+				.post(queryData)
+
+			futureResponse.map(
+				response =>
+					if (response.status == 200) {
+						Ok(createBarchartResponse(response.json, queryBuilderList, dateSpan, parsedQueryMode))
+					} else {
+						InternalServerError(response.body)
+					}
+			)
+
+		}
+
+	}
+
 	// Get top search queries.
 	def getQueriesTop() = Action.async {
 
@@ -558,6 +597,293 @@ class Application extends Controller {
 
 	}
 
+	// Create barchart response
+	def createBarchartResponse(responseData: JsValue, queryBuilderList: ListBuffer[QueryBuilder], dateSpan: DateSpan, queryMode: String) : JsValue = {
+
+		// Check if shard failed
+		val failedCount: Int = (responseData \ "_shards" \ "failed").as[Int]
+
+		if (failedCount > 0) {
+			return Json.obj("message" -> "Elasticsearch query failed.")
+		}
+
+		// Include aggregations
+		var aggList: ListBuffer[JsObject] = ListBuffer()
+		var aggObject: List[JsObject] = List()
+		for (qbl <- queryBuilderList) {
+
+			// Check if aggregation contains filters
+			if (!qbl.termFilters.isEmpty || (qbl.searchQuery.queryType == QUERY_TYPE_PHRASE && queryMode != QUERY_MODES(0))) {
+				aggObject = (responseData \ "aggregations" \ qbl.searchQuery.idSeq \ "term_agg" \ "buckets").as[List[JsObject]]
+			} else {
+				aggObject = (responseData \ "aggregations" \ qbl.searchQuery.idSeq \ "buckets").as[List[JsObject]]
+			} 
+			
+			// Create list of aggregations.
+			for (bucketObject <- aggObject) {
+
+				var keyString: String = if (queryMode != QUERY_MODES(0)) qbl.searchQuery.query else (bucketObject \ "key").as[String]
+				var qMode = if (qbl.searchQuery.queryType == QUERY_TYPE_PHRASE) queryMode else null
+
+				aggList += Json.obj(
+					"key" -> keyString,
+					"search_query" -> qbl.searchQuery.query,
+					"type" -> qbl.searchQuery.queryType,
+					"start_date" -> dateSpan.startDate.toString(),
+					"end_date" -> dateSpan.endDate.toString(),
+					"mode" -> qMode,
+					"filters" -> qbl.termFilters.map(tf => Json.obj(tf.key -> tf.terms)),
+					"doc_count" -> (bucketObject \ "doc_count").as[JsNumber],
+					"buckets" -> (bucketObject \ "nested_agg" \ "party_agg" \ "buckets").as[JsArray]
+				)
+			}
+		}
+
+		aggList = aggList.sortWith {
+			(a,b) =>
+				(a \ "doc_count").as[Int] > (b \ "doc_count").as[Int]
+		}
+
+		return Json.obj(
+			"es_query_time" -> (responseData \ "took").as[JsNumber],
+			"data" -> Json.toJson(aggList)
+		)
+
+	}
+
+	// Create barchart query
+	def createBarchartQuery(queryBuilderList: ListBuffer[QueryBuilder], analyzedQueries: ListBuffer[ListBuffer[String]], dateSpan: DateSpan, queryMode: String) : JsObject = {
+
+		var queryFilter: ListBuffer[JsObject] = ListBuffer()
+		//var termAgg: List[String] = List()
+		//var phraseAgg: List[String] = List()
+		//var wildcardAgg: String = ""
+
+
+		// Create query data object.
+		var partyAggregation: JsObject = Json.obj(
+			"nested_agg" -> Json.obj(
+				"nested" -> Json.obj(
+					"path" -> "dokintressent"
+				),
+				"aggs" -> Json.obj(
+					"party_agg" -> Json.obj(
+						"terms" -> Json.obj(
+							"field" -> "dokintressent.intressent.partibet",
+							"execution_hint" -> "global_ordinals_hash",
+                			"collect_mode" -> "breadth_first",
+                			"size" -> 10
+						)
+					)
+				)
+			)
+		)
+
+		// Date filter
+		var dateFilter: JsObject = Json.obj(
+			MOTIONER_MAPPINGS_DECODER("datum")._3 -> Json.obj(
+				MOTIONER_MAPPINGS_DECODER("datum")._2 -> Json.obj(
+					"gte" -> dateSpan.startDate.getMillis(),
+					"lte" -> dateSpan.endDate.getMillis(),
+					"format" -> "epoch_millis"
+				)
+			)
+		)
+
+		// Find query types and searches, if wildcard, ignore the rest.
+		var loopBreak: Boolean = false
+		var analyzedQueryCounter: Int = 0
+		for (qbl <- queryBuilderList) {
+
+			if (qbl.searchQuery.query == "") {
+				queryFilter = ListBuffer(Json.obj("match_all" -> Json.obj()))
+				loopBreak = true
+			} else if (!loopBreak) {
+				if (qbl.searchQuery.queryType == QUERY_TYPE_TERM) {
+					queryFilter += Json.obj("match" -> Json.obj("dokument.html" -> qbl.searchQuery.query))
+				}
+				else if (qbl.searchQuery.queryType == QUERY_TYPE_PHRASE) {
+
+					if (queryMode == QUERY_MODES(0)) { // Exact
+
+						queryFilter += Json.obj("match_phrase" -> Json.obj("dokument.html.shingles" -> qbl.searchQuery.query))
+
+					} else if (queryMode == QUERY_MODES(3)) { // Anywhere
+
+						queryFilter += Json.obj(
+							"match" -> Json.obj(
+								"dokument.html" -> Json.obj(
+									"query" -> qbl.searchQuery.query, 
+									"operator" -> "and"
+								)
+							)
+						)
+
+					} else { // Span near ordinal/not
+
+						var ordinal = if (queryMode == QUERY_MODES(1)) false else true
+						var spanTerms: ListBuffer[JsObject] = ListBuffer()
+						for (st <- analyzedQueries(analyzedQueryCounter)) {
+							spanTerms += Json.obj("span_term" -> Json.obj("dokument.html" -> st))
+						}
+
+						queryFilter += Json.obj(
+							"span_near" -> Json.obj(
+								"clauses" -> Json.toJson(spanTerms),
+								"slop" -> SPAN_NEAR_SLOP_COUNT,
+								"in_order" -> ordinal
+							)
+						)
+
+					}
+
+				}
+				else if (qbl.searchQuery.queryType == QUERY_TYPE_WILDCARD) {
+					queryFilter += Json.obj("match_phrase" -> Json.obj("dokument.html.shingles" -> qbl.searchQuery.query))
+				}
+			}
+
+			analyzedQueryCounter += 1
+		}
+		
+		// Create aggregation queries.
+		analyzedQueryCounter = 0
+		var aggregations: Map[String, JsObject] = Map()
+		for (qbl <- queryBuilderList) {
+
+			// Check if shingle field is required and anywhere or span near queries.
+			var queryField: String = "dokument.html.shingles"
+			var includeRegex: String = analyzedQueries(analyzedQueryCounter)(0)
+			var excludeRegex: String = ""
+
+			if (qbl.searchQuery.queryType == QUERY_TYPE_TERM || (qbl.searchQuery.queryType == QUERY_TYPE_PHRASE && queryMode != QUERY_MODES(0))) {
+				queryField = "dokument.html"
+			}
+
+			// Create term agg and check if search term is empty
+			var termAggregation = Json.obj(
+				"terms" -> Json.obj(
+					"min_doc_count" -> 0,
+					"field" -> queryField,
+					"execution_hint" -> ES_EXEC_HINT_PARAM,
+					"collect_mode" -> ES_EXEC_SEARCH_PARAM,
+					"include" -> includeRegex,
+					"exclude" -> excludeRegex,
+					"size" -> MOTIONER_AGG_MAX_COUNT
+				),
+				"aggs" -> partyAggregation
+			)
+
+			if (qbl.searchQuery.query == "") {
+				termAggregation = Json.obj(
+					"terms" -> Json.obj(
+						"min_doc_count" -> 0,
+						"field" -> queryField,
+						"execution_hint" -> ES_EXEC_HINT_PARAM,
+						"collect_mode" -> ES_EXEC_SEARCH_PARAM,
+						"size" -> MOTIONER_AGG_MAX_COUNT
+					),
+					"aggs" -> partyAggregation
+				)
+			}
+
+			// Check if there is any filter for this search.
+			if (!qbl.termFilters.isEmpty || (qbl.searchQuery.queryType == QUERY_TYPE_PHRASE && queryMode != QUERY_MODES(0))) {
+				var shouldFilters: ListBuffer[JsObject] = ListBuffer()
+				for (tf <- qbl.termFilters) {
+					if (MOTIONER_MAPPINGS_DECODER.exists(_._1 == tf.key)) {
+
+						// Create filter object.
+						var tmpFilter: JsObject = Json.obj(
+							"bool" -> Json.obj(
+								"should" -> Json.toJson(tf.terms.map(term => Json.obj(MOTIONER_MAPPINGS_DECODER(tf.key)._3 -> Json.obj(MOTIONER_MAPPINGS_DECODER(tf.key)._2 -> term))))
+							)
+						)
+
+						// Check if filter field is nested.
+						if (MOTIONER_MAPPINGS_DECODER(tf.key)._1 != null) {
+							shouldFilters += Json.obj(
+								"nested" -> Json.obj(
+									"path" -> MOTIONER_MAPPINGS_DECODER(tf.key)._1,
+									"query" -> tmpFilter
+								)
+							)
+						} else {
+							shouldFilters += Json.obj(
+								"query" -> tmpFilter
+							)
+						}
+					}
+				}
+
+				// Must filters for anywhere or near span searches
+				var mustFilters: ListBuffer[JsObject] = ListBuffer()
+				if (queryMode == QUERY_MODES(3)) {
+					mustFilters += Json.obj(
+						"match" -> Json.obj(
+							"dokument.html" -> Json.obj(
+								"query" -> qbl.searchQuery.query, 
+								"operator" -> "and"
+							)
+						)
+					)
+				} else if (queryMode == QUERY_MODES(1) || queryMode == QUERY_MODES(2)) {
+					var ordinal = if (queryMode == QUERY_MODES(1)) false else true
+					var spanTerms: ListBuffer[JsObject] = ListBuffer()
+					for (st <- analyzedQueries(analyzedQueryCounter)) {
+						spanTerms += Json.obj("span_term" -> Json.obj("dokument.html" -> st))
+					}
+
+					mustFilters += Json.obj(
+						"span_near" -> Json.obj(
+							"clauses" -> Json.toJson(spanTerms),
+							"slop" -> SPAN_NEAR_SLOP_COUNT,
+							"in_order" -> ordinal
+						)
+					)
+				}
+
+				// Define aggregation object.
+				aggregations += qbl.searchQuery.idSeq -> Json.obj(
+					"filter" -> Json.obj(
+						"bool" -> Json.obj(
+							"should" -> Json.toJson(shouldFilters),
+							"must" -> Json.toJson(mustFilters)
+						)
+					),
+					"aggs" -> Json.obj(
+						"term_agg" -> termAggregation
+					)
+				)
+			} else {
+				aggregations += qbl.searchQuery.idSeq -> termAggregation
+			} 
+
+			analyzedQueryCounter += 1
+		}
+		
+
+		var queryData = Json.obj(
+			"size" -> 0,
+			"query" -> Json.obj(
+				"filtered" -> Json.obj(
+					"filter" -> Json.obj(
+						"bool" -> Json.obj(
+							"should" -> Json.toJson(queryFilter),
+							"must" -> dateFilter
+						)
+					)
+				)
+			),
+			"aggs" -> Json.toJson(aggregations)
+		)
+
+		//println(Json.prettyPrint(queryData))
+
+		return queryData
+
+	}
+
 	// Create hitlist response
 	def createHitlistResponse(responseData: JsValue, queryBuilderList: ListBuffer[QueryBuilder], dateSpan: DateSpan, fromIndex: Int) : JsValue = {
 
@@ -707,6 +1033,10 @@ class Application extends Controller {
 			analyzedQueryCounter += 1
 
 		}
+
+		//for (qbl <- queryBuilderList) {
+		//	println(Json.prettyPrint(queryList(qbl.searchQuery.idSeq)))
+		//}
 
 		return queryList
 
